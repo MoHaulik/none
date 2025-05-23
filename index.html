@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Enhanced Onion Layer WebXR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { margin:0; overflow:hidden; font-family:Arial,sans-serif; }
+    #overlay {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      z-index: 1;
+    }
+    #start { 
+      padding:12px 24px; 
+      background:#4876FF; 
+      color:white; 
+      border:none; 
+      border-radius:30px; 
+      cursor:pointer; 
+      font-size:18px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      transition: all 0.3s ease;
+    }
+    #start:hover {
+      background: rgba(72, 118, 255, 1);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 12px rgba(0,0,0,0.3);
+    }
+    .exit-ar { 
+      position:fixed; 
+      top:20px; 
+      right:20px; 
+      padding:8px 16px; 
+      background:#ff4444; 
+      color:white; 
+      border:none; 
+      border-radius:30px; 
+      cursor:pointer; 
+      display:none; 
+      z-index: 1000;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    .xr-active .exit-ar { display:block; }
+    #info { 
+      position:absolute; 
+      bottom:20px; 
+      left:20px; 
+      color:white; 
+      text-shadow:0 0 4px rgba(0,0,0,0.8); 
+      background: rgba(0, 0, 0, 0.5);
+      padding: 10px 15px;
+      border-radius: 12px;
+      backdrop-filter: blur(5px);
+    }
+    #status {
+      margin-top: 15px;
+      font-size: 16px;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 10px 15px;
+      border-radius: 12px;
+      display: none;
+      backdrop-filter: blur(5px);
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start">Enter AR</button>
+    <div id="status"></div>
+  </div>
+  <button class="exit-ar" id="exit">Exit AR</button>
+  <div id="info">Point controller at layers to navigate • Squeeze to select</div>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+    
+    let scene, camera, renderer, xrSession, raycaster, mouse;
+    let layers = [], layerGroup, currentLayer = 0;
+    let controllers = [];
+    let activeControllers = new Set();
+    let highlightedLayer = null;
+    
+    // Shared transition state - driven by single render loop
+    let transitioning = false;
+    let transitionStart = null;
+    let transitionFromZ = 0;
+    let transitionToZ = 0;
+    let transitionIsXR = false;
+    let pendingLayer = 0;
+    
+    const layerData = [
+      { title: "Welcome", content: "Interactive 3D layers\nPoint and tap to explore", color: 0x4876FF },
+      { title: "Layer 1", content: "Discovery begins here\nEach layer reveals more", color: 0x48FF87 },
+      { title: "Layer 2", content: "Diving deeper\nInto the experience", color: 0xFF4887 },
+      { title: "Core", content: "The heart of the matter\nFull transparency revealed", color: 0xFF8748 }
+    ];
+    
+    function init() {
+      scene = new THREE.Scene();
+      scene.fog = new THREE.Fog(0x000000, 1, 8);
+      
+      camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 20);
+      camera.position.z = 2;
+      
+      renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+      renderer.xr.enabled = true;
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.setClearColor(0x000000, 0.9);
+      document.body.appendChild(renderer.domElement);
+      
+      raycaster = new THREE.Raycaster();
+      mouse = new THREE.Vector2();
+      
+      // Enhanced lighting for AR
+      const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+      const point = new THREE.PointLight(0xffffff, 1.2);
+      point.position.set(0, 2, 2);
+      point.castShadow = true;
+      scene.add(ambient, point);
+      
+      createLayers();
+      setupControls();
+      
+      renderer.setAnimationLoop(render);
+    }
+    
+    function createLayers() {
+      layerGroup = new THREE.Group();
+      
+      layerData.forEach((data, i) => {
+        const layer = new THREE.Group();
+        layer.position.z = -i * 1.5;
+        layer.userData = {index: i, data: data, isInteractable: true};
+        
+        // Semi-transparent plane with better material
+        const planeGeo = new THREE.PlaneGeometry(3, 2);
+        const planeMat = new THREE.MeshPhysicalMaterial({
+          color: data.color,
+          transparent: true,
+          opacity: 0.4, // Slightly more opaque for AR visibility
+          roughness: 0.1,
+          metalness: 0.2,
+          side: THREE.DoubleSide,
+          clearcoat: 0.5,
+          clearcoatRoughness: 0.1
+        });
+        const plane = new THREE.Mesh(planeGeo, planeMat);
+        plane.userData.isLayer = true;
+        plane.userData.layerIndex = i;
+        layer.add(plane);
+        
+        // Title box
+        const titleBox = createTextBox(data.title, 0, 0.5, 0.1);
+        layer.add(titleBox);
+        
+        // Content box
+        const contentBox = createTextBox(data.content, 0, -0.2, 0.05);
+        layer.add(contentBox);
+        
+        // 3D decoration
+        const decoration = create3DModel(data.color, i);
+        decoration.position.set(1.2, 0, 0.1);
+        layer.add(decoration);
+        
+        layers.push(layer);
+        layerGroup.add(layer);
+      });
+      
+      scene.add(layerGroup);
+    }
+    
+    function createTextBox(text, x, y, z) {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.width = 512;
+      canvas.height = 256;
+      
+      // Enhanced text rendering
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      
+      // Add subtle border
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(0, 0, canvas.width, canvas.height);
+      
+      // Text
+      ctx.fillStyle = 'black';
+      ctx.font = 'bold 32px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      
+      const lines = text.split('\n');
+      lines.forEach((line, i) => {
+        ctx.fillText(line, 256, 128 + (i - lines.length/2 + 0.5) * 40);
+      });
+      
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.MeshBasicMaterial({map: texture, transparent: true});
+      const geometry = new THREE.PlaneGeometry(1, 0.5);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.position.set(x, y, z);
+      
+      return mesh;
+    }
+    
+    function create3DModel(color, type) {
+      const group = new THREE.Group();
+      let geometry;
+      
+      switch(type % 4) {
+        case 0: geometry = new THREE.TetrahedronGeometry(0.2); break;
+        case 1: geometry = new THREE.OctahedronGeometry(0.2); break;
+        case 2: geometry = new THREE.IcosahedronGeometry(0.2); break;
+        case 3: geometry = new THREE.TorusGeometry(0.15, 0.05, 8, 16); break;
+      }
+      
+      const material = new THREE.MeshPhysicalMaterial({
+        color: color,
+        roughness: 0.2,
+        metalness: 0.8,
+        clearcoat: 0.5
+      });
+      
+      const mesh = new THREE.Mesh(geometry, material);
+      group.add(mesh);
+      
+      // Enhanced animation
+      mesh.userData.update = (time) => {
+        mesh.rotation.x = time * 0.001;
+        mesh.rotation.y = time * 0.002;
+        mesh.position.y = Math.sin(time * 0.003) * 0.05;
+      };
+      
+      return group;
+    }
+    
+    function setupControls() {
+      // Mouse/touch controls for non-XR
+      renderer.domElement.addEventListener('click', onPointerClick);
+      renderer.domElement.addEventListener('mousemove', onPointerMove);
+      
+      // Scroll zoom
+      window.addEventListener('wheel', (e) => {
+        if(!xrSession) camera.position.z += e.deltaY * 0.001;
+      });
+      
+      // Window resize
+      window.addEventListener('resize', () => {
+        camera.aspect = innerWidth/innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+      
+      // XR buttons
+      document.getElementById('start').onclick = startAR;
+      document.getElementById('exit').onclick = () => xrSession?.end();
+    }
+    
+    function onPointerMove(e) {
+      mouse.x = (e.clientX / innerWidth) * 2 - 1;
+      mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+    }
+    
+    function onPointerClick() {
+      if(transitioning || xrSession) return;
+      
+      raycaster.setFromCamera(mouse, camera);
+      const intersects = raycaster.intersectObjects(scene.children, true);
+      
+      for(let hit of intersects) {
+        if(hit.object.userData.isLayer) {
+          const layer = hit.object.parent;
+          navigateToLayer(layer.userData.index);
+          break;
+        }
+      }
+    }
+    
+    function navigateToLayer(index) {
+      if(index === currentLayer || transitioning) return;
+      
+      updateStatus(`Navigating to ${layerData[index].title}...`);
+      
+      // Set up transition state - let render loop handle the animation
+      transitioning = true;
+      transitionStart = null; // Will be set on first render frame
+      pendingLayer = index;
+      transitionIsXR = !!xrSession;
+      
+      if(transitionIsXR) {
+        // In XR: move the layer group, not the camera
+        transitionFromZ = layerGroup.position.z;
+        transitionToZ = index * 1.5; // Bring selected layer closer to user
+      } else {
+        // Desktop: move the camera
+        transitionFromZ = camera.position.z;
+        transitionToZ = -index * 1.5 + 2;
+      }
+    }
+    
+    function startAR() {
+      if (!navigator.xr) {
+        updateStatus('WebXR is not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar').then(supported => {
+        if(!supported) {
+          updateStatus('AR not supported on this device');
+          return;
+        }
+        
+        const sessionInit = { 
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+          domOverlay: { root: document.body } 
+        };
+        
+        navigator.xr.requestSession('immersive-ar', sessionInit).then(onSessionStarted);
+      });
+    }
+    
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.body.classList.add('xr-active');
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Reset layer group position for XR - position layers in front of user
+      layerGroup.position.set(0, 0, -2);
+      layerGroup.rotation.set(0, 0, 0);
+      
+      // Setup controllers with enhanced interaction
+      setupControllers(session);
+      
+      // Handle session end
+      session.addEventListener('end', onSessionEnd);
+      
+      updateStatus('AR mode active. Point controller at layers and squeeze to navigate.');
+      setTimeout(() => document.getElementById('status').style.display = 'none', 5000);
+    }
+    
+    function setupControllers(session) {
+      // Set up controllers
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        scene.add(controller);
+        
+        // Add events
+        controller.addEventListener('selectstart', onSelectStart);
+        controller.addEventListener('selectend', onSelectEnd);
+        
+        controllers.push(controller);
+        
+        // Add controller ray for visual feedback
+        const geometry = new THREE.CylinderGeometry(0.001, 0.001, 1, 8);
+        const material = new THREE.MeshBasicMaterial({
+          color: 0x00ff00,
+          transparent: true,
+          opacity: 0.5
+        });
+        const ray = new THREE.Mesh(geometry, material);
+        ray.rotation.x = -Math.PI / 2;
+        ray.position.z = -0.5;
+        ray.visible = false;
+        controller.add(ray);
+        controller.userData.ray = ray;
+      }
+    }
+    
+    function onSelectStart(event) {
+      const controller = event.target;
+      activeControllers.add(controller.userData.id);
+      
+      // Show controller ray
+      if(controller.userData.ray) {
+        controller.userData.ray.visible = true;
+      }
+      
+      // Check for layer intersections
+      checkLayerInteraction(controller);
+    }
+    
+    function onSelectEnd(event) {
+      const controller = event.target;
+      activeControllers.delete(controller.userData.id);
+      
+      // Hide controller ray
+      if(controller.userData.ray) {
+        controller.userData.ray.visible = false;
+      }
+      
+      // Clear highlights
+      if(highlightedLayer) {
+        highlightLayer(highlightedLayer, false);
+        highlightedLayer = null;
+      }
+    }
+    
+    function checkLayerInteraction(controller) {
+      // Set up raycaster for controller
+      const tempMatrix = new THREE.Matrix4();
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+      
+      const intersects = raycaster.intersectObjects(scene.children, true);
+      
+      for(let hit of intersects) {
+        if(hit.object.userData.isLayer) {
+          const layerIndex = hit.object.userData.layerIndex;
+          
+          // Navigate to next layer (or first if at last)
+          const nextLayer = (layerIndex + 1) % layerData.length;
+          navigateToLayer(nextLayer);
+          
+          // Highlight the layer briefly
+          highlightLayer(hit.object.parent, true);
+          highlightedLayer = hit.object.parent;
+          
+          break;
+        }
+      }
+    }
+    
+    function highlightLayer(layer, isHighlighted) {
+      if (!layer) return;
+      
+      layer.traverse((child) => {
+        if (child.isMesh && child.material) {
+          if (isHighlighted) {
+            // Store original values if not already stored
+            if (!child.material._originalEmissive) {
+              child.material._originalEmissive = child.material.emissive ? 
+                child.material.emissive.clone() : new THREE.Color(0x000000);
+            }
+            child.material.emissive = new THREE.Color(0x00ffff);
+            child.material.emissiveIntensity = 0.3;
+          } else if (child.material._originalEmissive) {
+            // Restore original material properties
+            child.material.emissive.copy(child.material._originalEmissive);
+            child.material.emissiveIntensity = 0;
+          }
+        }
+      });
+    }
+    
+    function onSessionEnd() {
+      document.body.classList.remove('xr-active');
+      xrSession = null;
+      controllers = [];
+      activeControllers.clear();
+      highlightedLayer = null;
+      
+      // Reset layer group position for desktop mode
+      layerGroup.position.set(0, 0, 0);
+      
+      // Reset camera position based on current layer
+      camera.position.z = -currentLayer * 1.5 + 2;
+      
+      updateStatus('AR session ended');
+      setTimeout(() => document.getElementById('status').style.display = 'none', 3000);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.style.display = 'block';
+      statusElement.textContent = message;
+    }
+    
+    function render(timestamp) {
+      // Handle layer transitions in the main render loop
+      if(transitioning) {
+        // Initialize start time on first frame
+        if(transitionStart === null) transitionStart = timestamp;
+        
+        const tRaw = (timestamp - transitionStart) / 1200; // 1.2 second transition
+        const t = Math.min(tRaw, 1);
+        const eased = t < 0.5 ? 2*t*t : -1 + (4-2*t)*t; // Ease in-out
+        
+        if(transitionIsXR) {
+          // XR mode: animate layer group position
+          layerGroup.position.z = transitionFromZ + (transitionToZ - transitionFromZ) * eased;
+        } else {
+          // Desktop mode: animate camera position  
+          camera.position.z = transitionFromZ + (transitionToZ - transitionFromZ) * eased;
+        }
+        
+        // Complete transition
+        if(t === 1) {
+          transitioning = false;
+          currentLayer = pendingLayer;
+          updateStatus(`Now viewing: ${layerData[currentLayer].title}`);
+          setTimeout(() => document.getElementById('status').style.display = 'none', 3000);
+        }
+      }
+      
+      // Update animations
+      scene.traverse(obj => {
+        if(obj.userData.update) obj.userData.update(timestamp);
+      });
+      
+      // Hover effect for non-XR mode
+      if(!xrSession) {
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(scene.children, true);
+        
+        layers.forEach(layer => {
+          const plane = layer.children[0];
+          if(plane && plane.material) {
+            plane.material.opacity = 0.4;
+          }
+        });
+        
+        for(let hit of intersects) {
+          if(hit.object.userData.isLayer && hit.object.material) {
+            hit.object.material.opacity = 0.6;
+            break;
+          }
+        }
+      }
+      
+      // XR controller ray casting for continuous feedback
+      if(xrSession && controllers.length > 0) {
+        controllers.forEach(controller => {
+          if(activeControllers.has(controller.userData.id)) {
+            // Update ray appearance based on what we're pointing at
+            const tempMatrix = new THREE.Matrix4();
+            tempMatrix.identity().extractRotation(controller.matrixWorld);
+            
+            raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+            raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+            
+            const intersects = raycaster.intersectObjects(scene.children, true);
+            let hitLayer = false;
+            
+            for(let hit of intersects) {
+              if(hit.object.userData.isLayer) {
+                hitLayer = true;
+                break;
+              }
+            }
+            
+            // Change ray color based on interaction possibility
+            if(controller.userData.ray) {
+              controller.userData.ray.material.color.setHex(hitLayer ? 0x00ff00 : 0xff0000);
+            }
+          }
+        });
+      }
+      
+      renderer.render(scene, camera);
+    }
+    
+    init();
+  </script>
+</body>
+</html>
